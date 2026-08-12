@@ -1,3 +1,9 @@
+v0.5.3 (unreleased):
+
+- Print the remote's URL when a fetch brings in updates, like `git pull` does,
+  so terminals can turn it into a clickable link. ssh-style remotes are shown
+  as their https equivalent.
+
 v0.5.2 (released June 9, 2025):
 
 - Support Python 3.13+.

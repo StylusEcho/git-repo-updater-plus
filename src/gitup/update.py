@@ -7,6 +7,7 @@ from glob import glob
 import os
 import re
 import shlex
+from urllib.parse import urlsplit
 
 from colorama import Fore, Style
 from git import RemoteReference as RemoteRef, Repo, exc
@@ -26,7 +27,13 @@ RESET = Style.RESET_ALL
 
 INDENT1 = " " * 3
 INDENT2 = " " * 7
+INDENT3 = " " * 11
 ERROR = RED + "Error:" + RESET
+
+# Matches scp-like remotes ([user@]host:path), but not drive letters or paths:
+SCP_LIKE = re.compile(r"(?:[^@/\\]+@)?(?P<host>[^:/\\]{2,}):(?P<path>[^\\]*)\Z")
+WEB_SCHEMES = {"http", "https"}
+SSH_SCHEMES = {"ssh", "git", "git+ssh", "ssh+git"}
 
 
 class _ProgressMonitor(RemoteProgress):
@@ -56,6 +63,57 @@ class _ProgressMonitor(RemoteProgress):
                 print("{0}/{1}".format(cur_count, max_count), end=end)
             else:
                 print(str(cur_count), end=end)
+
+
+def _get_remote_url(remote):
+    """Return a browsable URL for the given remote, or None if there is none.
+
+    ssh-style remotes are translated into their https equivalent, so that what
+    we print is something terminals will turn into a clickable link. Remotes
+    that aren't reachable over the web (local paths) give None. Any credentials
+    embedded in the URL are stripped, since we don't want to print those.
+    """
+    if not remote.config_reader.has_option("url"):
+        return None
+    url = remote.url.strip()
+    if not url:
+        return None
+
+    if "://" not in url:
+        scp = SCP_LIKE.match(url)
+        if not scp:
+            return None  # A local path
+        url = "ssh://{0}/{1}".format(scp.group("host"), scp.group("path").lstrip("/"))
+
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError as err:
+        logger.debug(err)
+        return None
+
+    if not host:
+        return None
+    if ":" in host:  # IPv6 literals lose their brackets when parsed
+        host = "[{0}]".format(host)
+
+    scheme = parts.scheme.lower()
+    if scheme in SSH_SCHEMES:
+        scheme = "https"  # The ssh port is meaningless over https, so drop it
+    elif scheme in WEB_SCHEMES:
+        if port:
+            host += ":{0}".format(port)
+    else:
+        return None  # file://, or something else we can't linkify
+
+    path = parts.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if path and not path.startswith("/"):
+        path = "/" + path
+
+    return "{0}://{1}{2}".format(scheme, host, path)
 
 
 def _fetch_remotes(remotes, prune):
@@ -113,6 +171,11 @@ def _fetch_remotes(remotes, prune):
                 colored = GREEN + desc + RESET
                 rlist.append("{0} ({1})".format(colored, ", ".join(names)))
         print(":", (", ".join(rlist) if rlist else up_to_date) + ".")
+
+        if rlist:  # Print a clickable link to the remote, like 'git pull' does
+            url = _get_remote_url(remote)
+            if url:
+                print(INDENT3, "From", url)
 
 
 def _update_branch(repo, branch, is_active=False):
