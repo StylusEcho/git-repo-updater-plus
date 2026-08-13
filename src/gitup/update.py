@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_JOBS",
+    "MAX_JOBS_PER_HOST",
+    "SUGGESTED_JOBS",
     "update_bookmarks",
     "update_directories",
     "run_command",
@@ -43,21 +45,23 @@ SCP_LIKE = re.compile(r"(?:[^@/\\]+@)?(?P<host>[^:/\\]{2,}):(?P<path>[^\\]*)\Z")
 WEB_SCHEMES = {"http", "https"}
 SSH_SCHEMES = {"ssh", "git", "git+ssh", "ssh+git"}
 
-# How many repos we update at once, and how many of those may talk to the same
-# host simultaneously. The per-host cap is the important one: it keeps a big
-# batch of repos that all live on GitHub from opening a connection per repo.
-DEFAULT_JOBS = 8
+# How many repos we update at once. Concurrency is opt-in, so the default is
+# one at a time; SUGGESTED_JOBS is what we point people at in --help. However
+# many are asked for, no more than MAX_JOBS_PER_HOST fetches will run against
+# any single host, so a few hundred repos on GitHub don't mean a few hundred
+# connections to GitHub.
+DEFAULT_JOBS = 1
+SUGGESTED_JOBS = 8
 MAX_JOBS_PER_HOST = 4
 
 
 class _Output:
     """Buffers the console output for a single repository.
 
-    Repos are updated concurrently, so printing as we go would interleave the
-    output of unrelated repos. We also don't know whether a repo is worth
-    showing at all until we're done with it: unless the user asks for
-    everything, repos without updates or errors are hidden. Lines printed with
-    note() are the ones that make a repo worth showing.
+    Repos may be updated concurrently, in which case printing as we go would
+    interleave the output of unrelated repos. Under --changed-only we also
+    don't know whether a repo is worth showing at all until we're done with it.
+    Lines printed with note() are the ones that make a repo worth showing.
     """
 
     def __init__(self):
@@ -122,10 +126,7 @@ class _Session:
         self.jobs = max(1, min(max(1, args.jobs), total))
         self.limiter = _HostLimiter(min(self.jobs, MAX_JOBS_PER_HOST))
         self.stopping = threading.Event()
-
-        # Repos are only hidden when there are several of them: if the user
-        # asked about one repo, they want to hear about it either way.
-        self.quiet = total > 1 and not args.show_all
+        self.quiet = args.changed_only
 
     @contextmanager
     def fetching(self, repo, host):
