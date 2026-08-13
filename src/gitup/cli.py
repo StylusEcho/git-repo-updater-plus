@@ -21,6 +21,7 @@ from gitup.config import (
 from gitup.update import (
     DEFAULT_JOBS,
     MAX_JOBS_PER_HOST,
+    SUGGESTED_JOBS,
     update_bookmarks,
     update_directories,
     run_command,
@@ -94,18 +95,17 @@ def _build_parser():
         metavar="n",
         type=int,
         default=DEFAULT_JOBS,
-        help="""number of repositories to update at the same time (default:
-        {0}); at most {1} of them will talk to the same host at once, no matter
-        how high this is set""".format(DEFAULT_JOBS, MAX_JOBS_PER_HOST),
+        help="""update this many repositories at the same time (default: {0},
+        i.e. one after another); {1} is a good place to start. No more than {2}
+        of them will talk to the same host at once, however high this is
+        set""".format(DEFAULT_JOBS, SUGGESTED_JOBS, MAX_JOBS_PER_HOST),
     )
     group_u.add_argument(
-        "-A",
-        "--all",
-        dest="show_all",
+        "-C",
+        "--changed-only",
         action="store_true",
-        help="""print every repository, even the ones with nothing to report
-        (by default, when updating more than one repository, only those with
-        updates or errors are shown)""",
+        help="""only print repositories that have something to report: updates,
+        errors, or branches that couldn't be fast-forwarded""",
     )
 
     group_b.add_argument(

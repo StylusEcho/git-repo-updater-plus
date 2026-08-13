@@ -148,9 +148,21 @@ def clones(tmp_path):
     return clones
 
 
-def test_only_notable_repos_are_printed(clones, capsys):
-    """make sure repos with nothing to report are hidden in a multi-repo run"""
+def test_every_repo_is_printed_by_default(clones, capsys):
+    """make sure we report on every repo unless we're asked not to"""
     args = _build_parser().parse_args([])
+    update_directories([str(clones)], args)
+    captured = capsys.readouterr()
+
+    assert "repo_updated" in captured.out
+    assert "branch update" in captured.out
+    assert "repo_current" in captured.out
+    assert "repo up to date" not in captured.out  # No summary line
+
+
+def test_changed_only_hides_quiet_repos(clones, capsys):
+    """make sure --changed-only hides the repos with nothing to report"""
+    args = _build_parser().parse_args(["--changed-only"])
     update_directories([str(clones)], args)
     captured = capsys.readouterr()
 
@@ -160,36 +172,24 @@ def test_only_notable_repos_are_printed(clones, capsys):
     assert "1 repo up to date" in captured.out
 
 
-def test_show_all_prints_every_repo(clones, capsys):
-    """make sure --all brings back the repos we'd otherwise hide"""
-    args = _build_parser().parse_args(["--all"])
-    update_directories([str(clones)], args)
-    captured = capsys.readouterr()
-
-    assert "repo_updated" in captured.out
-    assert "repo_current" in captured.out
-    assert "up to date" in captured.out  # The repo we'd otherwise have hidden
-    assert "repo up to date" not in captured.out  # No summary line
-
-
-def test_single_repo_is_always_printed(clones, capsys):
-    """make sure a repo named directly is reported on even with no updates"""
-    args = _build_parser().parse_args([])
+def test_changed_only_applies_to_a_single_repo(clones, capsys):
+    """make sure --changed-only is honored even when one repo was named"""
+    args = _build_parser().parse_args(["--changed-only"])
     update_directories([str(clones / "repo_current")], args)
     captured = capsys.readouterr()
 
-    assert "repo_current" in captured.out
-    assert "up to date" in captured.out
+    assert "Fetching" not in captured.out
+    assert "1 repo up to date" in captured.out
 
 
 def test_repos_are_printed_in_order(clones, capsys):
     """make sure concurrent updates don't scramble the output"""
     for name in ("aaa", "zzz"):
         _git(clones, "clone", "-q", str(clones / "repo_updated"), name)
-    args = _build_parser().parse_args(["--all", "--jobs", "4"])
+    args = _build_parser().parse_args(["--jobs", "4"])
     update_directories([str(clones)], args)
     captured = capsys.readouterr()
 
-    names = [name for name in ("aaa", "repo_current", "repo_updated", "zzz")]
+    names = ["aaa", "repo_current", "repo_updated", "zzz"]
     positions = [captured.out.index(name + ":") for name in names]
     assert positions == sorted(positions)
