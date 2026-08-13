@@ -3,19 +3,27 @@
 # Copyright (C) 2011-2018 Ben Kurtovic <ben.kurtovic@gmail.com>
 # Released under the terms of the MIT License. See LICENSE for details.
 import logging
-from glob import glob
 import os
 import re
 import shlex
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from glob import glob
+from io import StringIO
 from urllib.parse import urlsplit
 
 from colorama import Fore, Style
 from git import RemoteReference as RemoteRef, Repo, exc
-from git.util import RemoteProgress
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["update_bookmarks", "update_directories", "run_command"]
+__all__ = [
+    "DEFAULT_JOBS",
+    "update_bookmarks",
+    "update_directories",
+    "run_command",
+]
 
 BOLD = Style.BRIGHT
 BLUE = Fore.BLUE + BOLD
@@ -35,47 +43,119 @@ SCP_LIKE = re.compile(r"(?:[^@/\\]+@)?(?P<host>[^:/\\]{2,}):(?P<path>[^\\]*)\Z")
 WEB_SCHEMES = {"http", "https"}
 SSH_SCHEMES = {"ssh", "git", "git+ssh", "ssh+git"}
 
+# How many repos we update at once, and how many of those may talk to the same
+# host simultaneously. The per-host cap is the important one: it keeps a big
+# batch of repos that all live on GitHub from opening a connection per repo.
+DEFAULT_JOBS = 8
+MAX_JOBS_PER_HOST = 4
 
-class _ProgressMonitor(RemoteProgress):
-    """Displays relevant output during the fetching process."""
+
+class _Output:
+    """Buffers the console output for a single repository.
+
+    Repos are updated concurrently, so printing as we go would interleave the
+    output of unrelated repos. We also don't know whether a repo is worth
+    showing at all until we're done with it: unless the user asks for
+    everything, repos without updates or errors are hidden. Lines printed with
+    note() are the ones that make a repo worth showing.
+    """
 
     def __init__(self):
-        super(_ProgressMonitor, self).__init__()
-        self._started = False
+        self._buffer = StringIO()
+        self.notable = False
 
-    def update(self, op_code, cur_count, max_count=None, message=""):
-        """Called whenever progress changes. Overrides default behavior."""
-        if op_code & (self.COMPRESSING | self.RECEIVING):
-            cur_count = str(int(cur_count))
-            if max_count:
-                max_count = str(int(max_count))
-            if op_code & self.BEGIN:
-                print("\b, " if self._started else " (", end="")
-                if not self._started:
-                    self._started = True
-            if op_code & self.END:
-                end = ")"
-            elif max_count:
-                end = "\b" * (1 + len(cur_count) + len(max_count))
-            else:
-                end = "\b" * len(cur_count)
-            if max_count:
-                print("{0}/{1}".format(cur_count, max_count), end=end)
-            else:
-                print(str(cur_count), end=end)
+    def print(self, *args, **kwargs):
+        """Buffer a line of output, as print() would write it."""
+        print(*args, file=self._buffer, **kwargs)
+
+    def note(self, *args, **kwargs):
+        """Buffer a line that makes this repo worth showing the user."""
+        self.notable = True
+        self.print(*args, **kwargs)
+
+    def getvalue(self):
+        """Return everything buffered so far."""
+        return self._buffer.getvalue()
 
 
-def _get_remote_url(remote):
-    """Return a browsable URL for the given remote, or None if there is none.
+class _HostLimiter:
+    """Caps how many fetches may run against a single host at the same time.
 
-    ssh-style remotes are translated into their https equivalent, so that what
-    we print is something terminals will turn into a clickable link. Remotes
-    that aren't reachable over the web (local paths) give None. Any credentials
-    embedded in the URL are stripped, since we don't want to print those.
+    Updating a few hundred repos in parallel would mean a few hundred
+    simultaneous connections to whoever hosts them, which is rude at best and
+    rate-limited at worst. Fetches from local paths aren't limited.
     """
-    if not remote.config_reader.has_option("url"):
-        return None
-    url = remote.url.strip()
+
+    def __init__(self, limit):
+        self._limit = max(1, limit)
+        self._lock = threading.Lock()
+        self._semaphores = {}
+
+    @contextmanager
+    def hold(self, host):
+        """Context manager that holds a slot for the given host, if any."""
+        if not host:
+            yield
+            return
+        with self._lock:
+            if host not in self._semaphores:
+                self._semaphores[host] = threading.Semaphore(self._limit)
+            semaphore = self._semaphores[host]
+        with semaphore:
+            yield
+
+
+class _Batch:
+    """A base path given by the user, and the repositories found inside it."""
+
+    def __init__(self, header=None, repos=()):
+        self.header = header
+        self.repos = list(repos)
+        self.futures = []
+
+
+class _Session:
+    """The settings and shared state behind a single run of updates."""
+
+    def __init__(self, args, total):
+        self.args = args
+        self.jobs = max(1, min(max(1, args.jobs), total))
+        self.limiter = _HostLimiter(min(self.jobs, MAX_JOBS_PER_HOST))
+        self.stopping = threading.Event()
+
+        # Repos are only hidden when there are several of them: if the user
+        # asked about one repo, they want to hear about it either way.
+        self.quiet = total > 1 and not args.show_all
+
+    @contextmanager
+    def fetching(self, repo, host):
+        """Context manager wrapping a fetch from the given host.
+
+        Besides waiting for a free slot on the host, this stops git from
+        prompting on the terminal when we're running several fetches at once,
+        since they'd all be reading from it at the same time and the user would
+        have no idea which repo was asking. Fetches that need to ask something
+        fail instead, and are reported like any other fetch error; running with
+        --jobs 1 gets the prompts back.
+        """
+        with self.limiter.hold(host):
+            if self.jobs == 1:
+                yield
+                return
+            ssh_command = os.environ.get("GIT_SSH_COMMAND", "ssh")
+            with repo.git.custom_environment(
+                GIT_TERMINAL_PROMPT="0",
+                GIT_SSH_COMMAND=ssh_command + " -o BatchMode=yes",
+            ):
+                yield
+
+
+def _split_remote_url(url):
+    """Split a remote URL into a (scheme, host, port, path) tuple, or None.
+
+    Returns None for anything that isn't a network remote (local paths).
+    """
+    url = url.strip()
     if not url:
         return None
 
@@ -93,21 +173,52 @@ def _get_remote_url(remote):
         logger.debug(err)
         return None
 
-    if not host:
+    scheme = parts.scheme.lower()
+    if not host or (scheme not in WEB_SCHEMES and scheme not in SSH_SCHEMES):
+        return None  # file://, or something else we don't know how to reach
+    return scheme, host, port, parts.path
+
+
+def _get_remote_config_url(remote):
+    """Return the configured URL of a remote, or None if it has none."""
+    if not remote.config_reader.has_option("url"):
         return None
+    return remote.url
+
+
+def _get_remote_host(remote):
+    """Return the hostname a remote fetches from, or None if it's local."""
+    url = _get_remote_config_url(remote)
+    if not url:
+        return None
+    split = _split_remote_url(url)
+    return split[1] if split else None
+
+
+def _get_remote_url(remote):
+    """Return a browsable URL for the given remote, or None if there is none.
+
+    ssh-style remotes are translated into their https equivalent, so that what
+    we print is something terminals will turn into a clickable link. Remotes
+    that aren't reachable over the web (local paths) give None. Any credentials
+    embedded in the URL are stripped, since we don't want to print those.
+    """
+    url = _get_remote_config_url(remote)
+    if not url:
+        return None
+    split = _split_remote_url(url)
+    if not split:
+        return None
+    scheme, host, port, path = split
+
     if ":" in host:  # IPv6 literals lose their brackets when parsed
         host = "[{0}]".format(host)
-
-    scheme = parts.scheme.lower()
     if scheme in SSH_SCHEMES:
         scheme = "https"  # The ssh port is meaningless over https, so drop it
-    elif scheme in WEB_SCHEMES:
-        if port:
-            host += ":{0}".format(port)
-    else:
-        return None  # file://, or something else we can't linkify
+    elif port:
+        host += ":{0}".format(port)
 
-    path = parts.path.rstrip("/")
+    path = path.rstrip("/")
     if path.endswith(".git"):
         path = path[: -len(".git")]
     if path and not path.startswith("/"):
@@ -116,8 +227,8 @@ def _get_remote_url(remote):
     return "{0}://{1}{2}".format(scheme, host, path)
 
 
-def _fetch_remotes(remotes, prune):
-    """Fetch a list of remotes, displaying progress info along the way."""
+def _fetch_remotes(out, repo, remotes, session):
+    """Fetch a list of remotes, reporting what came in along the way."""
 
     def _get_name(ref):
         """Return the local name of a remote or tag reference."""
@@ -132,14 +243,17 @@ def _fetch_remotes(remotes, prune):
     up_to_date = BLUE + "up to date" + RESET
 
     for remote in remotes:
-        print(INDENT2, "Fetching", BOLD + remote.name, end="")
+        if session.stopping.is_set():
+            return
+        out.print(INDENT2, "Fetching", BOLD + remote.name, end="")
 
         if not remote.config_reader.has_option("fetch"):
-            print(":", YELLOW + "skipped:", "no configured refspec.")
+            out.note(":", YELLOW + "skipped:", "no configured refspec.")
             continue
 
         try:
-            results = remote.fetch(progress=_ProgressMonitor(), prune=prune)
+            with session.fetching(repo, _get_remote_host(remote)):
+                results = remote.fetch(prune=session.args.prune)
         except exc.GitCommandError as err:
             # We should have to do this ourselves, but GitPython doesn't give
             # us a sensible way to get the raw stderr...
@@ -150,11 +264,11 @@ def _fetch_remotes(remotes, prune):
                 msg = "{0} failed with status {1}.".format(command, err.status)
             elif not msg.endswith("."):
                 msg += "."
-            print(":", RED + "error:", msg)
+            out.note(":", RED + "error:", msg)
             return
         except AssertionError:  # Seems to be the result of a bug in GitPython
             # This happens when git initiates an auto-gc during fetch:
-            print(
+            out.note(
                 ":",
                 RED + "error:",
                 "something went wrong in GitPython,",
@@ -170,53 +284,56 @@ def _fetch_remotes(remotes, prune):
                 desc = singular if len(names) == 1 else plural
                 colored = GREEN + desc + RESET
                 rlist.append("{0} ({1})".format(colored, ", ".join(names)))
-        print(":", (", ".join(rlist) if rlist else up_to_date) + ".")
 
-        if rlist:  # Print a clickable link to the remote, like 'git pull' does
+        if rlist:
+            out.note(":", ", ".join(rlist) + ".")
+            # Print a clickable link to the remote, like 'git pull' does:
             url = _get_remote_url(remote)
             if url:
-                print(INDENT3, "From", url)
+                out.print(INDENT3, "From", url)
+        else:
+            out.print(":", up_to_date + ".")
 
 
-def _update_branch(repo, branch, is_active=False):
+def _update_branch(out, repo, branch, is_active=False):
     """Update a single branch."""
-    print(INDENT2, "Updating", BOLD + branch.name, end=": ")
+    out.print(INDENT2, "Updating", BOLD + branch.name, end=": ")
     upstream = branch.tracking_branch()
     if not upstream:
-        print(YELLOW + "skipped:", "no upstream is tracked.")
+        out.print(YELLOW + "skipped:", "no upstream is tracked.")
         return
     try:
         branch.commit
     except ValueError:
-        print(YELLOW + "skipped:", "branch has no revisions.")
+        out.print(YELLOW + "skipped:", "branch has no revisions.")
         return
     try:
         upstream.commit
     except ValueError:
-        print(YELLOW + "skipped:", "upstream does not exist.")
+        out.print(YELLOW + "skipped:", "upstream does not exist.")
         return
 
     try:
         base = repo.git.merge_base(branch.commit, upstream.commit)
     except exc.GitCommandError as err:
         logger.debug(err)
-        print(YELLOW + "skipped:", "can't find merge base with upstream.")
+        out.note(YELLOW + "skipped:", "can't find merge base with upstream.")
         return
 
     if repo.commit(base) == upstream.commit:
-        print(BLUE + "up to date", end=".\n")
+        out.print(BLUE + "up to date", end=".\n")
         return
 
     if is_active:
         try:
             repo.git.merge(upstream.name, ff_only=True)
-            print(GREEN + "done", end=".\n")
+            out.note(GREEN + "done", end=".\n")
         except exc.GitCommandError as err:
             msg = err.stderr
             if "local changes" in msg and "would be overwritten" in msg:
-                print(YELLOW + "skipped:", "uncommitted changes.")
+                out.note(YELLOW + "skipped:", "uncommitted changes.")
             else:
-                print(YELLOW + "skipped:", "not possible to fast-forward.")
+                out.note(YELLOW + "skipped:", "not possible to fast-forward.")
     else:
         status = repo.git.merge_base(
             branch.commit,
@@ -226,13 +343,13 @@ def _update_branch(repo, branch, is_active=False):
             with_exceptions=False,
         )[0]
         if status != 0:
-            print(YELLOW + "skipped:", "not possible to fast-forward.")
+            out.note(YELLOW + "skipped:", "not possible to fast-forward.")
         else:
             repo.git.branch(branch.name, upstream.name, force=True)
-            print(GREEN + "done", end=".\n")
+            out.note(GREEN + "done", end=".\n")
 
 
-def _update_repository(repo, repo_name, args):
+def _update_repository(out, repo, session):
     """Update a single git repository by fetching remotes and rebasing/merging.
 
     The specific actions depend on the arguments given. We will fetch all
@@ -242,15 +359,14 @@ def _update_repository(repo, repo_name, args):
     upstreams. If *args.prune* is ``True``, remote-tracking branches that no
     longer exist on their remote after fetching will be deleted.
     """
-    print(INDENT1, BOLD + repo_name + ":")
-
+    args = session.args
     try:
         active = repo.active_branch
     except TypeError:  # Happens when HEAD is detached
         active = None
     if args.current_only:
         if not active:
-            print(
+            out.note(
                 INDENT2,
                 ERROR,
                 "--current-only doesn't make sense with a detached HEAD.",
@@ -258,46 +374,61 @@ def _update_repository(repo, repo_name, args):
             return
         ref = active.tracking_branch()
         if not ref:
-            print(INDENT2, ERROR, "no remote tracked by current branch.")
+            out.note(INDENT2, ERROR, "no remote tracked by current branch.")
             return
         remotes = [repo.remotes[ref.remote_name]]
     else:
         remotes = repo.remotes
 
     if not remotes:
-        print(INDENT2, ERROR, "no remotes configured to fetch.")
+        out.note(INDENT2, ERROR, "no remotes configured to fetch.")
         return
-    _fetch_remotes(remotes, args.prune)
+    _fetch_remotes(out, repo, remotes, session)
 
-    if not args.fetch_only:
+    if not args.fetch_only and not session.stopping.is_set():
         for branch in sorted(repo.heads, key=lambda b: b.name):
-            _update_branch(repo, branch, branch == active)
+            _update_branch(out, repo, branch, branch == active)
 
 
-def _run_command(repo, repo_name, args):
+def _update_repository_task(path, repo_name, session):
+    """Update one repository in a worker thread, returning its output."""
+    out = _Output()
+    out.print(INDENT1, BOLD + repo_name + ":")
+    if session.stopping.is_set():
+        return out
+    try:
+        _update_repository(out, Repo(path), session)
+    except Exception as err:  # Don't let one bad repo take down the whole run
+        logger.debug(err, exc_info=True)
+        out.note(INDENT2, ERROR, "{0}: {1}".format(type(err).__name__, err))
+    return out
+
+
+def _run_command(path, repo_name, args):
     """Run an arbitrary shell command on the given repository."""
-    print(INDENT1, BOLD + repo_name + ":")
+    out = _Output()
+    out.note(INDENT1, BOLD + repo_name + ":")
 
     cmd = shlex.split(args.command)
     try:
-        out = repo.git.execute(cmd, with_extended_output=True, with_exceptions=False)
+        repo = Repo(path)
+        result = repo.git.execute(cmd, with_extended_output=True, with_exceptions=False)
     except exc.GitCommandNotFound as err:
-        print(INDENT2, ERROR, err)
-        return
+        out.note(INDENT2, ERROR, err)
+        return out
 
-    for line in out[1].splitlines() + out[2].splitlines():
-        print(INDENT2, line)
+    for line in result[1].splitlines() + result[2].splitlines():
+        out.note(INDENT2, line)
+    return out
 
 
-def _dispatch(base_path, callback, args):
-    """Apply a callback function on each valid repo in the given path.
+def _collect_batch(base_path, args):
+    """Find all repositories inside the given base path.
 
     Determine whether the directory is a git repo on its own, a directory of
     git repositories, a shell glob pattern, or something invalid. If the first,
-    apply the callback on it; if the second or third, apply the callback on all
-    repositories contained within; if the last, print an error.
-
-    The given args are passed directly to the callback function after the repo.
+    the batch contains it alone; if the second or third, it contains all
+    repositories inside; if the last, the batch is just an error message.
     """
 
     def _collect(paths, max_depth):
@@ -342,28 +473,69 @@ def _dispatch(base_path, callback, args):
     except exc.NoSuchPathError:
         if is_comment(base):
             comment = get_comment(base)
-            if comment:
-                print(CYAN + BOLD + comment)
-            return
+            return _Batch(header=CYAN + BOLD + comment if comment else None)
         paths = glob(base)
         if not paths:
-            print(ERROR, BOLD + base, "doesn't exist!")
-            return
+            return _Batch(header=" ".join([ERROR, BOLD + base, "doesn't exist!"]))
         valid = _collect(paths, max_depth)
     except exc.InvalidGitRepositoryError:
         if not os.path.isdir(base) or args.max_depth == 0:
-            print(ERROR, BOLD + base, "isn't a repository!")
-            return
+            return _Batch(header=" ".join([ERROR, BOLD + base, "isn't a repository!"]))
         valid = _collect([base], max_depth)
 
     base = os.path.abspath(base)
     suffix = "" if len(valid) == 1 else "s"
-    print(BOLD + base, "({0} repo{1}):".format(len(valid), suffix))
+    header = "{0} ({1} repo{2}):".format(BOLD + base, len(valid), suffix)
 
     valid = [os.path.abspath(path) for path in valid]
     paths = [(_get_basename(base, path), path) for path in valid]
-    for name, path in sorted(paths):
-        callback(Repo(path), name, args)
+    return _Batch(header=header, repos=sorted(paths))
+
+
+def _print_batch(batch, quiet):
+    """Print the results of a batch, waiting on its repos in order.
+
+    Repos finish in whatever order the threads get to them, but they are always
+    printed in the order they were found, so output is deterministic. In quiet
+    mode, repos with nothing to report are replaced by a summary line.
+    """
+    if batch.header:
+        print(batch.header)
+
+    hidden = 0
+    for future in batch.futures:
+        out = future.result()
+        if out.notable or not quiet:
+            print(out.getvalue(), end="")
+        else:
+            hidden += 1
+
+    if hidden:
+        suffix = "" if hidden == 1 else "s"
+        summary = "{0} repo{1} up to date".format(hidden, suffix)
+        print(INDENT1, BLUE + summary + RESET + ".")
+
+
+def _update_repos(base_paths, args):
+    """Update all repositories in the given base paths, concurrently."""
+    batches = [_collect_batch(path, args) for path in base_paths]
+    total = sum(len(batch.repos) for batch in batches)
+    session = _Session(args, total)
+
+    pool = ThreadPoolExecutor(max_workers=session.jobs)
+    try:
+        for batch in batches:
+            batch.futures = [
+                pool.submit(_update_repository_task, path, name, session)
+                for name, path in batch.repos
+            ]
+        for batch in batches:
+            _print_batch(batch, session.quiet)
+    except BaseException:  # Including a Ctrl-C while we're waiting on a repo
+        session.stopping.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown()
 
 
 def is_comment(path):
@@ -382,17 +554,24 @@ def update_bookmarks(bookmarks, args):
         print("You don't have any bookmarks configured! Get help with 'gitup -h'.")
         return
 
-    for path in bookmarks:
-        _dispatch(path, _update_repository, args)
+    _update_repos(bookmarks, args)
 
 
 def update_directories(paths, args):
     """Update a list of directories supplied by command arguments."""
-    for path in paths:
-        _dispatch(path, _update_repository, args)
+    _update_repos(paths, args)
 
 
 def run_command(paths, args):
-    """Run an arbitrary shell command on all repos."""
+    """Run an arbitrary shell command on all repos.
+
+    Unlike updating, this is done one repo at a time, and everything is
+    printed: an arbitrary command's output is the whole point, and running
+    unknown commands in parallel is a good way to get surprised.
+    """
     for path in paths:
-        _dispatch(path, _run_command, args)
+        batch = _collect_batch(path, args)
+        if batch.header:
+            print(batch.header)
+        for name, repo_path in batch.repos:
+            print(_run_command(repo_path, name, args).getvalue(), end="")

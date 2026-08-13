@@ -3,6 +3,15 @@ v0.5.3 (unreleased):
 - Print the remote's URL when a fetch brings in updates, like `git pull` does,
   so terminals can turn it into a clickable link. ssh-style remotes are shown
   as their https equivalent.
+- When updating more than one repository, only print the repos that got updates
+  or ran into problems; the rest are summarized as a count. Pass `--all` (`-A`)
+  to print everything, as before.
+- Update repositories concurrently, controlled by `--jobs` (`-j`, default 8).
+  At most four fetches will run against the same host at once. Since parallel
+  fetches can't share the terminal, git is told not to prompt unless updates
+  are running one at a time (`--jobs 1`).
+- Remove the inline per-remote fetch progress display, which can't be shown
+  now that repos are fetched in parallel and printed once they're done.
 
 v0.5.2 (released June 9, 2025):
 

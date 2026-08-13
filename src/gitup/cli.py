@@ -18,7 +18,13 @@ from gitup.config import (
     list_bookmarks,
     clean_bookmarks,
 )
-from gitup.update import update_bookmarks, update_directories, run_command
+from gitup.update import (
+    DEFAULT_JOBS,
+    MAX_JOBS_PER_HOST,
+    update_bookmarks,
+    update_directories,
+    run_command,
+)
 
 
 def _build_parser():
@@ -80,6 +86,26 @@ def _build_parser():
         action="store_true",
         help="""after fetching, delete
         remote-tracking branches that no longer exist on their remote""",
+    )
+
+    group_u.add_argument(
+        "-j",
+        "--jobs",
+        metavar="n",
+        type=int,
+        default=DEFAULT_JOBS,
+        help="""number of repositories to update at the same time (default:
+        {0}); at most {1} of them will talk to the same host at once, no matter
+        how high this is set""".format(DEFAULT_JOBS, MAX_JOBS_PER_HOST),
+    )
+    group_u.add_argument(
+        "-A",
+        "--all",
+        dest="show_all",
+        action="store_true",
+        help="""print every repository, even the ones with nothing to report
+        (by default, when updating more than one repository, only those with
+        updates or errors are shown)""",
     )
 
     group_b.add_argument(

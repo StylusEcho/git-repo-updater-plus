@@ -96,6 +96,21 @@ After fetching, gitup will _keep_ remote-tracking branches that no longer exist
 upstream. Pass `--prune` (or `-p`) to delete them, or set `fetch.prune` or
 `remote.<name>.prune` in your git config to do this by default.
 
+When updating more than one repository, gitup only prints the repos that have
+something to say: ones that got updates, and ones that hit an error or couldn't
+be fast-forwarded. The rest are summarized as a count at the end of the group.
+Pass `--all` (or `-A`) to print every repository, or name a single repo, which
+is always reported on in full.
+
+Repositories are updated several at a time. Use `--jobs` (or `-j`) to change how
+many, e.g. `--jobs 1` to go back to updating them one by one. No matter how high
+you set it, gitup will not run more than four fetches against the same host at
+once, so pointing it at a few hundred GitHub repos won't open a few hundred
+connections to GitHub. Note that when more than one repo is being updated at a
+time, git is told not to prompt on the terminal (several repos asking for a
+password at once is unusable); repos that need to ask something will report a
+fetch error instead. Use `--jobs 1` if you need those prompts.
+
 For a full list of all command arguments and abbreviations:
 
     gitup --help
